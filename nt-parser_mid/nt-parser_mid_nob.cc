@@ -32,7 +32,7 @@
 
 // dictionaries
 cnn::Dict termdict, ntermdict, adict, posdict;
-
+bool DEBUG;
 volatile bool requested_stop = false;
 unsigned IMPLICIT_REDUCE_AFTER_SHIFT = 0;
 unsigned LAYERS = 2;
@@ -87,6 +87,7 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
         ("train,t", "Should training be run?")
         ("words,w", po::value<string>(), "Pretrained word embeddings")
         ("beam_size,b", po::value<unsigned>()->default_value(1), "beam size")
+	("debug","debug")
         ("help,h", "Help");
   po::options_description dcmdline_options;
   dcmdline_options.add(opts);
@@ -178,39 +179,62 @@ struct ParserBuilder {
   }
 
 // checks to see if a proposed action is valid in discriminative models
-static bool IsActionForbidden_Discriminative(const string& a, char prev_a, unsigned bsize, unsigned ssize, unsigned nopen_parens) {
+static bool IsActionForbidden_Discriminative(const string& a, char prev_a, unsigned bsize, unsigned ssize, unsigned nopen_parens, unsigned unary) {
   bool is_shift = (a[0] == 'S' && a[1]=='H');
   bool is_reduce = (a[0] == 'R' && a[1]=='E');
   bool is_nt = (a[0] == 'N');
-  assert(is_shift || is_reduce || is_nt);
+  bool is_term = (a[0] == 'T');
+  assert(is_shift || is_reduce || is_nt || is_term) ;
   static const unsigned MAX_OPEN_NTS = 100;
-  if (is_nt && nopen_parens > MAX_OPEN_NTS) return true;
-  if (ssize == 1) {
-    if (!is_nt) return true;
+  static const unsigned MAX_UNARY = 3;
+//  if (is_nt && nopen_parens > MAX_OPEN_NTS) return true;
+  if (is_term){
+    if(ssize == 2 && bsize == 1 && prev_a == 'R') return false;
+    return true;
+  }
+
+  if(ssize == 1){
+     if(!is_shift) return true;
+     return false;
+  }
+
+  if (is_shift){
+    if(bsize == 1) return true;
+    if(nopen_parens == 0) return true;
     return false;
   }
 
-  if (IMPLICIT_REDUCE_AFTER_SHIFT) {
+  if (is_nt) {
+    if(bsize == 1 && unary >= MAX_UNARY) return true;
+    if(prev_a == 'N') return true;
+    return false; 
+  }
+
+  if (is_reduce){
+    if(unary > MAX_UNARY) return true;
+    if(nopen_parens == 0) return true;
+    return false;
+  }
+
+/*  if (IMPLICIT_REDUCE_AFTER_SHIFT) { //default 0
     // if a SHIFT has an implicit REDUCE, then only shift after an NT:
     if (is_shift && prev_a != 'N') return true;
   }
-
+*/
   // be careful with top-level parens- you can only close them if you
   // have fully processed the buffer
-  if (nopen_parens == 1 && bsize > 1) {
-    if (IMPLICIT_REDUCE_AFTER_SHIFT && is_shift) return true;
+/*  if (nopen_parens == 1 && bsize > 1) {
+//    if (IMPLICIT_REDUCE_AFTER_SHIFT && is_shift) return true;
     if (is_reduce) return true;
   }
-
+*/
   // you can't reduce after an NT action
-  if (is_reduce && prev_a == 'N') return true;
-  if (is_nt && bsize == 1) return true;
-  if (is_shift && bsize == 1) return true;
-  if (is_reduce && ssize < 3) return true;
+//  if (is_reduce && prev_a == 'N') return true;
+//  if (is_nt && bsize == 1) return true;
+//  if (is_reduce && ssize < 3) return true;
 
   // TODO should we control the depth of the parse in some way? i.e., as long as there
   // are items in the buffer, we can do an NT operation, which could cause trouble
-  return false;
 }
 
 
@@ -225,6 +249,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
                      double *right,
                      bool is_evaluation,
                      bool sample = false) {
+if(DEBUG) cerr << "sent size: " << sent.size()<<"\n";
     vector<unsigned> results;
     const bool build_training_graph = correct_actions.size() > 0;
     bool apply_dropout = (DROPOUT && !is_evaluation);
@@ -304,8 +329,9 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
     // dummy symbol to represent the empty buffer
     buffer[0] = parameter(*hg, p_buffer_guard);
     bufferi[0] = -999;
-    for (auto& b : buffer)
-      buffer_lstm->add_input(b);
+//    for (auto& b : buffer)
+//      buffer_lstm->add_input(b);
+    buffer_lstm->add_input(buffer[0]);
 
     vector<Expression> stack;  // variables representing subtree embeddings
     vector<int> stacki; // position of words in the sentence of head of subtree
@@ -320,16 +346,38 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
     unsigned action_count = 0;  // incremented at each prediction
     unsigned nt_count = 0; // number of times an NT has been introduced
     vector<unsigned> current_valid_actions;
+    unsigned unary = 0;
     int nopen_parens = 0;
     char prev_a = '0';
-    while(stack.size() > 2 || buffer.size() > 1) {
+//    while(stack.size() > 2 || buffer.size() > 1) {
+    while(true){
+	if(prev_a == 'T') break;
       // get list of possible actions for the current parser state
+if(DEBUG) cerr<< "action_count " << action_count <<"\n";
       current_valid_actions.clear();
+if(DEBUG) cerr<< "unary: " << unary << "nopen_parens: "<<nopen_parens<<"\n";
       for (auto a: possible_actions) {
-        if (IsActionForbidden_Discriminative(adict.Convert(a), prev_a, buffer.size(), stack.size(), nopen_parens))
+        if (IsActionForbidden_Discriminative(adict.Convert(a), prev_a, buffer.size(), stack.size(), nopen_parens, unary))
           continue;
         current_valid_actions.push_back(a);
       }
+if(DEBUG){
+	cerr <<"current_valid_actions: "<<current_valid_actions.size()<<" :";
+	for(unsigned i = 0; i < current_valid_actions.size(); i ++){
+		cerr<<adict.Convert(current_valid_actions[i])<<" ";
+	}
+	cerr <<"\n";
+
+	unsigned j = 999;
+	for(unsigned i = 0; i < current_valid_actions.size(); i ++){
+                if(current_valid_actions[i] == correct_actions[action_count]) {j = i; break;}
+        }
+	if(j == 999){
+		cerr<<"gold out\n";
+		exit(1);
+	}
+
+}
       //cerr << "valid actions = " << current_valid_actions.size() << endl;
 
       // p_t = pbias + S * slstm + B * blstm + A * almst
@@ -341,6 +389,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         action_summary = dropout(action_summary, DROPOUT);
         buffer_summary = dropout(buffer_summary, DROPOUT);
       }
+      //Expression p_t = affine_transform({pbias, S, stack_summary, A, action_summary});
       Expression p_t = affine_transform({pbias, S, stack_summary, B, buffer_summary, A, action_summary});
       Expression nlp_t = rectify(p_t);
       //if (build_training_graph) nlp_t = dropout(nlp_t, 0.4);
@@ -396,11 +445,30 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       //cerr << "ACT: " << actionString << endl;
       const char ac = actionString[0];
       const char ac2 = actionString[1];
-      prev_a = ac;
+if(DEBUG){
+      
+      cerr << "MODEL_ACT: " << adict.Convert(model_action)<<" ";
+      cerr <<"GOLD_ACT: " << actionString<<"\n";
+}
+
+if(DEBUG) {
+        cerr <<"stacki: ";
+        for(unsigned i = 0; i < stacki.size(); i ++){
+                cerr<<stacki[i]<<" ";
+        }
+        cerr<<"\n";
+
+        cerr<<"is_open_paren: ";
+        for(unsigned i = 0; i < is_open_paren.size(); i ++){
+                cerr<<is_open_paren[i]<<" ";
+        }
+        cerr<<"\n";
+
+}
 
       if (ac =='S' && ac2=='H') {  // SHIFT
         assert(buffer.size() > 1); // dummy symbol means > 1 (not >= 1)
-        if (IMPLICIT_REDUCE_AFTER_SHIFT) {
+/*        if (IMPLICIT_REDUCE_AFTER_SHIFT) {
           --nopen_parens;
           int i = is_open_paren.size() - 1;
           assert(is_open_paren[i] >= 0);
@@ -419,18 +487,19 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
           stack.push_back(pt);
           stacki.push_back(999);
           is_open_paren.push_back(-1);
-        } else {
+        } else {*/
           stack.push_back(buffer.back());
           stack_lstm.add_input(buffer.back());
           stacki.push_back(bufferi.back());
           buffer.pop_back();
-          buffer_lstm->rewind_one_step();
+          buffer_lstm->add_input(buffer.back());
           bufferi.pop_back();
           is_open_paren.push_back(-1);
-        }
+        //}
+	unary = 0;
       } else if (ac == 'N') { // NT
         ++nopen_parens;
-        assert(buffer.size() > 1);
+        assert(stack.size() > 1);
         auto it = action2NTindex.find(action);
         assert(it != action2NTindex.end());
         int nt_index = it->second;
@@ -440,16 +509,18 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         stack_lstm.add_input(nt_embedding);
         stacki.push_back(-1);
         is_open_paren.push_back(nt_index);
-      } else { // REDUCE
+      } else if (ac == 'R'){ // REDUCE
         --nopen_parens;
+	if(prev_a == 'N') unary += 1;
+	if(prev_a == 'R') unary = 0;
         assert(stack.size() > 2); // dummy symbol means > 2 (not >= 2)
         // find what paren we are closing
         int i = is_open_paren.size() - 1;
         while(is_open_paren[i] < 0) { --i; assert(i >= 0); }
         Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
         int nchildren = is_open_paren.size() - i - 1;
-        assert(nchildren > 0);
-        //cerr << "  number of children to reduce: " << nchildren << endl;
+        assert(nchildren+1 > 0);
+if(DEBUG) cerr << "  number of children to reduce: " << nchildren << endl;
         vector<Expression> children(nchildren);
         const_lstm_fwd.start_new_sequence();
         const_lstm_rev.start_new_sequence();
@@ -458,18 +529,25 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         // TO BE COMPOSED INTO A TREE EMBEDDING
         for (i = 0; i < nchildren; ++i) {
           children[i] = stack.back();
-          assert (stacki.back() != -1);
           stacki.pop_back();
           stack.pop_back();
           stack_lstm.rewind_one_step();
           is_open_paren.pop_back();
         }
-	is_open_paren.pop_back(); // nt symbol
+
+        is_open_paren.pop_back(); // nt symbol
         assert (stacki.back() == -1);
         stacki.pop_back(); // nonterminal dummy
         stack.pop_back(); // nonterminal dummy
-        stack_lstm.rewind_one_step(); // nt symbol
+        stack_lstm.rewind_one_step(); // nt symbol 
 
+	children.push_back(stack.back()); // leftmost
+	stacki.pop_back(); //leftmost
+	stack.pop_back(); //leftmost
+	stack_lstm.rewind_one_step(); //leftmost
+	is_open_paren.pop_back(); //leftmost
+
+	nchildren ++;
         // BUILD TREE EMBEDDING USING BIDIR LSTM
         const_lstm_fwd.add_input(nonterminal);
         const_lstm_rev.add_input(nonterminal);
@@ -490,6 +568,9 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         stacki.push_back(999); // who knows, should get rid of this
         is_open_paren.push_back(-1); // we just closed a paren at this position
       }
+      else{// TERMINATE
+      }
+      prev_a = ac;
     }
     if (build_training_graph && action_count != correct_actions.size()) {
       cerr << "Unexecuted actions remain but final state reached!\n";
@@ -558,7 +639,7 @@ static bool all_complete(const vector<ParserState>& pq) {
 // this lets us use pretrained embeddings, when available, for words that were OOV in the
 // parser training data
 // set sample=true to sample rather than max
-vector<unsigned> log_prob_parser_beam(ComputationGraph* hg,
+/*vector<unsigned> log_prob_parser_beam(ComputationGraph* hg,
                      const parser::Sentence& sent,
                      const vector<int>& correct_actions,
                      double *right,
@@ -847,9 +928,8 @@ vector<unsigned> log_prob_parser_beam(ComputationGraph* hg,
     Expression tot_neglogprob = -sum(log_probs);
     assert(tot_neglogprob.pg != nullptr);
     return results;
-  }
+  }*/
 };
-
 void signal_callback_handler(int /* signum */) {
   if (requested_stop) {
     cerr << "\nReceived SIGINT again, quitting.\n";
@@ -860,7 +940,7 @@ void signal_callback_handler(int /* signum */) {
 }
 
 int main(int argc, char** argv) {
-  cnn::Initialize(argc, argv, 1989121011);
+  cnn::Initialize(argc, argv);//, 1989121011);
 
   cerr << "COMMAND LINE:"; 
   for (unsigned i = 0; i < static_cast<unsigned>(argc); ++i) cerr << ' ' << argv[i];
@@ -869,6 +949,7 @@ int main(int argc, char** argv) {
 
   po::variables_map conf;
   InitCommandLine(argc, argv, &conf);
+  DEBUG = conf.count("debug");
   IMPLICIT_REDUCE_AFTER_SHIFT = conf.count("explicit_terminal_reduce") == 0;
   USE_POS = conf.count("use_pos_tags");
   if (conf.count("dropout"))
@@ -1036,10 +1117,7 @@ int main(int argc, char** argv) {
         double trs = 0;
         double right = 0;
         double dwords = 0;
-        ostringstream os;
-        os << "/tmp/parser_dev_eval." << getpid() << ".txt";
-        const string pfx = os.str();
-        ofstream out(pfx.c_str());
+        ofstream out("dev.act");
         auto t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < dev_size; ++sii) {
            const auto& sentence=dev_corpus.sents[sii];
@@ -1054,20 +1132,7 @@ int main(int argc, char** argv) {
            vector<unsigned> pred = parser.log_prob_parser(&hg,sentence,vector<int>(),&right,true);
            int ti = 0;
            for (auto a : pred) {
-             if (adict.Convert(a)[0] == 'N') {
-               out << '(' << ntermdict.Convert(action2NTindex.find(a)->second) << ' ';
-             } else if (adict.Convert(a)[0] == 'S') {
-               if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                 out << termdict.Convert(sentence.raw[ti++]) << ") ";
-               } else {
-                 if (true) {
-                   string preterminal = "XX";
-                   out << '(' << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ") ";
-                 } else { // use this branch to surpress preterminals
-                   out << termdict.Convert(sentence.raw[ti++]) << ' ';
-                 }
-               }
-             } else out << ") ";
+		out << adict.Convert(a) << endl;
            }
            out << endl;
            double lp = 0;
@@ -1076,13 +1141,17 @@ int main(int argc, char** argv) {
         auto t_end = chrono::high_resolution_clock::now();
         out.close();
         double err = (trs - right) / trs;
-        cerr << "Dev output in " << pfx << endl;
+
+	std::string command_1="python mid2tree.py dev.act " + conf["dev_data"].as<string>() + " > dev.eval" ;
+	const char* cmd_1=command_1.c_str();
+	cerr<<system(cmd_1)<<"\n";
+
         //parser::EvalBResults res = parser::Evaluate("foo", pfx);
-	std::string command="python remove_dev_unk.py "+ corpus.devdata +" "+pfx+" > evaluable.txt";
+	std::string command="python remove_dev_unk.py "+ corpus.devdata +" dev.eval > evaluable.txt";
 	const char* cmd=command.c_str();
 	system(cmd);
 
-        std::string command2="EVALB/evalb -p EVALB/COLLINS.prm "+corpus.devdata+" evaluable.txt>evalbout.txt";
+        std::string command2="EVALB/evalb -p EVALB/COLLINS.prm "+corpus.devdata+" evaluable.txt > evalbout.txt";
         const char* cmd2=command2.c_str();
 
         system(cmd2);
@@ -1112,13 +1181,27 @@ int main(int argc, char** argv) {
           cerr << "  new best...writing model to " << fname << " ...\n";
           best_dev_err = err;
 	  bestf1=newfmeasure;
-          ofstream out(fname);
+	  ostringstream part_os;
+  	  part_os << "ntparse"
+     	      << (USE_POS ? "_pos" : "")
+              << '_' << IMPLICIT_REDUCE_AFTER_SHIFT
+              << '_' << LAYERS
+              << '_' << INPUT_DIM
+              << '_' << HIDDEN_DIM
+              << '_' << ACTION_DIM
+              << '_' << LSTM_INPUT_DIM
+              << "-pid" << getpid() 
+	      << "-part" << (tot_seen/corpus.size()) << ".params";
+ 	  
+	  const string part = part_os.str();
+ 
+          ofstream out("model/"+part);
           boost::archive::text_oarchive oa(out);
           oa << model;
-          system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
+          system("cp dev.eval dev.eval.best");
           // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.
-          if (!softlinkCreated) {
+          /*if (!softlinkCreated) {
             string softlink = " latest_model";
             if (system((string("rm -f ") + softlink).c_str()) == 0 && 
                 system((string("ln -s ") + fname + softlink).c_str()) == 0) {
@@ -1126,7 +1209,7 @@ int main(int argc, char** argv) {
                    << " for convenience." << endl;
             }
             softlinkCreated = true;
-          }
+          }*/
         }
       }
     }
@@ -1147,32 +1230,19 @@ int main(int argc, char** argv) {
              ComputationGraph hg;
              vector<unsigned> pred = parser.log_prob_parser(&hg,sentence,actions,&right,sample,true);
              double lp = as_scalar(hg.incremental_forward());
-             cout << sii << " ||| " << -lp << " |||";
+             cout << sii << " ||| " << -lp << " |||\n";
              int ti = 0;
              for (auto a : pred) {
-               if (adict.Convert(a)[0] == 'N') {
-                 cout << " (" << ntermdict.Convert(action2NTindex.find(a)->second);
-               } else if (adict.Convert(a)[0] == 'S') {
-                 if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                   cout << termdict.Convert(sentence.raw[ti++]) << ")";
-                 } else {
-                   if (!sample) {
-                     //string preterminal = "XX";
-                     //cout << " (" << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ")";
-                     cout << ' ' << termdict.Convert(sentence.raw[ti++]);
-                   } else { // use this branch to surpress preterminals
-                     cout << ' ' << termdict.Convert(sentence.raw[ti++]);
-                   }
-                 }
-               } else cout << ')';
-             }
+             	cout << adict.Convert(a);
+		if (adict.Convert(a) == "SHIFT"){
+			cout<<" "<<termdict.Convert(sentence.raw[ti++]);
+		}
+		cout << endl;
+	     }
              cout << endl;
            }
        }
-       ostringstream os;
-        os << "/tmp/parser_test_eval." << getpid() << ".txt";
-        const string pfx = os.str();
-        ofstream out(pfx.c_str());
+        ofstream out("test.act");
         t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < test_size; ++sii) {
            const auto& sentence=test_corpus.sents[sii];
@@ -1187,21 +1257,8 @@ int main(int argc, char** argv) {
            vector<unsigned> pred = parser.log_prob_parser(&hg,sentence,vector<int>(),&right,true);
            int ti = 0;
            for (auto a : pred) {
-             if (adict.Convert(a)[0] == 'N') {
-               out << '(' << ntermdict.Convert(action2NTindex.find(a)->second) << ' ';
-             } else if (adict.Convert(a)[0] == 'S') {
-               if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                 out << termdict.Convert(sentence.raw[ti++]) << ") ";
-               } else {
-                 if (true) {
-                   string preterminal = "XX";
-                   out << '(' << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ") ";
-                 } else { // use this branch to surpress preterminals
-                   out << termdict.Convert(sentence.raw[ti++]) << ' ';
-                 }
-               }
-             } else out << ") ";
-           }
+           	out << adict.Convert(a) << endl;
+	   }
            out << endl;
            double lp = 0;
            trs += actions.size();
@@ -1209,13 +1266,17 @@ int main(int argc, char** argv) {
         auto t_end = chrono::high_resolution_clock::now();
         out.close();
         double err = (trs - right) / trs;
-        cerr << "Test output in " << pfx << endl;
-        //parser::EvalBResults res = parser::Evaluate("foo", pfx);
-        std::string command="python remove_dev_unk.py "+ corpus.devdata +" "+pfx+" > evaluable.txt";
+
+        std::string command_1="python mid2tree.py test.act " + conf["test_data"].as<string>() + " > test.eval" ;
+        const char* cmd_1=command_1.c_str();
+        cerr<<system(cmd_1)<<"\n";
+
+	//parser::EvalBResults res = parser::Evaluate("foo", pfx);
+        std::string command="python remove_dev_unk.py "+ corpus.devdata +" test.eval > evaluable.txt";
         const char* cmd=command.c_str();
         system(cmd);
 
-        std::string command2="EVALB/evalb -p EVALB/COLLINS.prm "+corpus.devdata+" evaluable.txt>evalbout.txt";
+        std::string command2="EVALB/evalb -p EVALB/COLLINS.prm "+corpus.devdata+" evaluable.txt > evalbout.txt";
         const char* cmd2=command2.c_str();
 
         system(cmd2);

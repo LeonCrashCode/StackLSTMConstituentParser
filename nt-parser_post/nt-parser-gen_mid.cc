@@ -34,6 +34,7 @@
 // dictionaries
 cnn::Dict termdict, ntermdict, adict, posdict;
 
+bool DEBUG = 0;
 volatile bool requested_stop = false;
 unsigned kSOS = 0;
 unsigned IMPLICIT_REDUCE_AFTER_SHIFT = 0;
@@ -79,6 +80,7 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
         ("lstm_input_dim", po::value<unsigned>()->default_value(60), "LSTM input dimension")
         ("train,t", "Should training be run?")
         ("words,w", po::value<string>(), "Pretrained word embeddings")
+        ("debug", "debug")
 	("help,h", "Help");
   po::options_description dcmdline_options;
   dcmdline_options.add(opts);
@@ -156,21 +158,40 @@ struct ParserBuilder {
     }
   }
 
-// checks to see if a proposed action is valid in discriminative models
-static bool IsActionForbidden_Generative(const string& a, char prev_a, unsigned tsize, unsigned ssize, unsigned nopen_parens) {
+static bool IsActionForbidden_Generative(const string& a, char prev_a, unsigned tsize, unsigned ssize, unsigned nopen_parens, unsigned unary) {
   bool is_shift = (a[0] == 'S' && a[1]=='H');
   bool is_reduce = (a[0] == 'R' && a[1]=='E');
   bool is_nt = (a[0] == 'N');
-  assert(is_shift || is_reduce || is_nt);
+  bool is_term = (a[0] == 'T');
+  assert(is_shift || is_reduce || is_nt || is_term) ;
   static const unsigned MAX_OPEN_NTS = 100;
-  if (is_nt && nopen_parens > MAX_OPEN_NTS) return true;
-  if (ssize == 1) {
-    if (!is_nt) return true;
+  static const unsigned MAX_UNARY = 3;
+//  if (is_nt && nopen_parens > MAX_OPEN_NTS) return true;
+  if (is_term){
+    if(ssize == 2 && prev_a == 'R') return false;
+    return true;
+  }
+
+  if(ssize == 1){
+     if(!is_shift) return true;
+     return false;
+  }
+
+  if (is_shift){
+    if(nopen_parens == 0) return true;
     return false;
   }
-  // you can't reduce after an NT action
-  if (is_reduce && prev_a == 'N') return true;
-  return false;
+
+  if (is_nt) {
+    if(prev_a == 'N') return true;
+    return false; 
+  }
+
+  if (is_reduce){
+    if(unary > MAX_UNARY) return true;
+    if(nopen_parens == 0) return true;
+    return false;
+  }
 }
 
 // returns parse actions for input sentence (in training just returns the reference)
@@ -249,16 +270,37 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
     int nopen_parens = 0;
     char prev_a = '0';
     unsigned termc = 0;
-    while(stack.size() > 2 || termc == 0) {
+    unsigned unary = 0;
+    while(true) {
+      if(prev_a == 'T') break;
       assert (stack.size() == stack_content.size());
       // get list of possible actions for the current parser state
+if(DEBUG) cerr<< "action_count " << action_count <<"\n";
       current_valid_actions.clear();
+if(DEBUG) cerr<< "unary: " << unary << "nopen_parens: "<<nopen_parens<<"\n";      
       for (auto a: possible_actions) {
-        if (IsActionForbidden_Generative(adict.Convert(a), prev_a, terms.size(), stack.size(), nopen_parens))
+        if (IsActionForbidden_Generative(adict.Convert(a), prev_a, terms.size(), stack.size(), nopen_parens, unary))
           continue;
         current_valid_actions.push_back(a);
       }
       //cerr << "valid actions = " << current_valid_actions.size() << endl;
+if(DEBUG){
+        cerr <<"current_valid_actions: "<<current_valid_actions.size()<<" :";
+        for(unsigned i = 0; i < current_valid_actions.size(); i ++){
+                cerr<<adict.Convert(current_valid_actions[i])<<" ";
+        }
+        cerr <<"\n";
+
+        unsigned j = 999;
+        for(unsigned i = 0; i < current_valid_actions.size(); i ++){
+                if(current_valid_actions[i] == correct_actions[action_count]) {j = i; break;}
+        }
+        if(j == 999){
+                cerr<<"gold out\n";
+                exit(1);
+        }
+
+}
 
       //onerep
       Expression stack_summary = stack_lstm.back();
@@ -320,7 +362,22 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       //cerr << "ACT: " << actionString << endl;
       const char ac = actionString[0];
       const char ac2 = actionString[1];
-      prev_a = ac;
+
+if(DEBUG){
+
+      cerr <<"GOLD_ACT: " << actionString<<"\n";
+}
+
+if(DEBUG) {
+
+        cerr<<"is_open_paren: ";
+        for(unsigned i = 0; i < is_open_paren.size(); i ++){
+                cerr<<is_open_paren[i]<<" ";
+        }
+        cerr<<"\n";
+
+}
+
 
       if (ac =='S' && ac2=='H') {  // SHIFT
         unsigned wordid = 0;
@@ -347,6 +404,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         stack.push_back(word);
         stack_lstm.add_input(word);
         is_open_paren.push_back(-1);
+	unary = 0;
       } else if (ac == 'N') { // NT
         ++nopen_parens;
         auto it = action2NTindex.find(action);
@@ -358,16 +416,18 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         stack.push_back(nt_embedding);
         stack_lstm.add_input(nt_embedding);
         is_open_paren.push_back(nt_index);
-      } else { // REDUCE
+      } else if (ac == 'R'){ // REDUCE
         --nopen_parens;
-        assert(stack.size() > 2); // dummy symbol means > 2 (not >= 2)
+        if(prev_a == 'N') unary += 1;
+        if(prev_a == 'R') unary = 0;
+        assert(stack.size() > 1); // dummy symbol means > 2 (not >= 2)
         assert(stack_content.size() > 2 && stack.size() == stack_content.size());
         // find what paren we are closing
         int i = is_open_paren.size() - 1; //get the last thing on the stack
         while(is_open_paren[i] < 0) { --i; assert(i >= 0); } //iteratively decide whether or not it's a non-terminal
         Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
         int nchildren = is_open_paren.size() - i - 1;
-        assert(nchildren > 0);
+        assert(nchildren+1 > 0);
         //cerr << "  number of children to reduce: " << nchildren << endl;
         vector<Expression> children(nchildren);
         const_lstm_fwd.start_new_sequence();
@@ -401,6 +461,14 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         assert (stack.size() == stack_content.size());
         //cerr << "Done reducing" << endl;
 
+	children.push_back(stack.back()); // leftmost
+        stack.pop_back(); //leftmost
+        stack_lstm.rewind_one_step(); //leftmost
+        is_open_paren.pop_back(); //leftmost
+        stack_content.pop_back();
+
+        nchildren ++;
+
         // BUILD TREE EMBEDDING USING BIDIR LSTM
         const_lstm_fwd.add_input(nonterminal);
         const_lstm_rev.add_input(nonterminal);
@@ -421,7 +489,9 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
         stack_content.push_back(curr_word);
         //cerr << curr_word << endl;
         is_open_paren.push_back(-1); // we just closed a paren at this position
-      }
+      } else {
+	}
+      prev_a = ac;
     }
     if (action_count != correct_actions.size()) {
       cerr << "Unexecuted actions remain but final state reached!\n";
@@ -472,6 +542,7 @@ int main(int argc, char** argv) {
     cerr << "You specified --train but did not specify --dev_data FILE\n";
     return 1;
   }
+  DEBUG = conf.count("debug");
   ostringstream os;
   os << "ntparse_gen"
      << "_D" << DROPOUT
@@ -602,12 +673,12 @@ int main(int argc, char** argv) {
       llh = trs = right = words = 0;
       static int logc = 0;
       ++logc;
-      if (logc > 50) {
+      /*if (logc > 50) {
         // generate random sample
         ComputationGraph cg;
         double x;
         parser.log_prob_parser(&cg, parser::Sentence(), vector<int>(),&x,true);
-      }
+      }*/
       if (logc % 100 == 0) { // report on dev set
         unsigned dev_size = dev_corpus.size();
         double llh = 0;

@@ -32,16 +32,21 @@
 
 // dictionaries
 cnn::Dict termdict, ntermdict, adict, posdict;
-
+bool DEBUG = false;
 volatile bool requested_stop = false;
-unsigned IMPLICIT_REDUCE_AFTER_SHIFT = 0;
 unsigned LAYERS = 2;
 unsigned INPUT_DIM = 40;
-unsigned HIDDEN_DIM = 60;
-unsigned ACTION_DIM = 36;
 unsigned PRETRAINED_DIM = 50;
-unsigned LSTM_INPUT_DIM = 60;
+unsigned ACTION_DIM = 36;
 unsigned POS_DIM = 10;
+unsigned REL_DIM = 8;
+
+unsigned BILSTM_INPUT_DIM = 64;
+unsigned BILSTM_HIDDEN_DIM = 64;
+unsigned ATTENTION_HIDDEN_DIM = 64;
+
+unsigned STATE_INPUT_DIM = ACTION_DIM + ATTENTION_HIDDEN_DIM;
+unsigned STATE_HIDDEN_DIM = 64; 
 
 float ALPHA = 1.f;
 unsigned N_SAMPLES = 1;
@@ -67,27 +72,27 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
   po::options_description opts("Configuration options");
   opts.add_options()
         ("training_data,T", po::value<string>(), "List of Transitions - Training corpus")
-        ("explicit_terminal_reduce,x", "[recommended] If set, the parser must explicitly process a REDUCE operation to complete a preterminal constituent")
         ("dev_data,d", po::value<string>(), "Development corpus")
         ("bracketing_dev_data,C", po::value<string>(), "Development bracketed corpus")
-
         ("test_data,p", po::value<string>(), "Test corpus")
         ("dropout,D", po::value<float>(), "Dropout rate")
         ("samples,s", po::value<unsigned>(), "Sample N trees for each test sentence instead of greedy max decoding")
         ("alpha,a", po::value<float>(), "Flatten (0 < alpha < 1) or sharpen (1 < alpha) sampling distribution")
         ("model,m", po::value<string>(), "Load saved model from this file")
         ("use_pos_tags,P", "make POS tags visible to parser")
-        ("layers", po::value<unsigned>()->default_value(2), "number of LSTM layers")
+        ("layers", po::value<unsigned>()->default_value(1), "number of LSTM layers")
         ("action_dim", po::value<unsigned>()->default_value(16), "action embedding size")
         ("pos_dim", po::value<unsigned>()->default_value(12), "POS dimension")
-        ("input_dim", po::value<unsigned>()->default_value(32), "input embedding size")
-        ("hidden_dim", po::value<unsigned>()->default_value(64), "hidden dimension")
+	("input_dim", po::value<unsigned>()->default_value(32), "input embedding size")
+	("bilstm_input_dim", po::value<unsigned>()->default_value(64), "bilstm input dimension")
+        ("bilstm_hidden_dim", po::value<unsigned>()->default_value(64), "bilstm hidden dimension")
+        ("attention_hidden_dim", po::value<unsigned>()->default_value(64), "attention hidden dimension")
+        ("state_hidden_dim", po::value<unsigned>()->default_value(64), "state hidden dimension")
         ("pretrained_dim", po::value<unsigned>()->default_value(50), "pretrained input dimension")
-        ("lstm_input_dim", po::value<unsigned>()->default_value(60), "LSTM input dimension")
         ("train,t", "Should training be run?")
         ("words,w", po::value<string>(), "Pretrained word embeddings")
-        ("beam_size,b", po::value<unsigned>()->default_value(1), "beam size")
         ("help,h", "Help");
+      
   po::options_description dcmdline_options;
   dcmdline_options.add(opts);
   po::store(parse_command_line(argc, argv, dcmdline_options), *conf);
@@ -102,75 +107,76 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
 }
 
 struct ParserBuilder {
-  LSTMBuilder stack_lstm; // (layers, input, hidden, trainer)
-  LSTMBuilder *buffer_lstm;
-  LSTMBuilder action_lstm;
-  LSTMBuilder const_lstm_fwd;
-  LSTMBuilder const_lstm_rev;
+
+  LSTMBuilder state_lstm;
+  LSTMBuilder l2rbuilder;
+  LSTMBuilder r2lbuilder;
   LookupParameters* p_w; // word embeddings
   LookupParameters* p_t; // pretrained word embeddings (not updated)
-  LookupParameters* p_nt; // nonterminal embeddings
-  LookupParameters* p_ntup; // nonterminal embeddings when used in a composed representation
   LookupParameters* p_a; // input action embeddings
-  LookupParameters* p_pos; // pos embeddings (optional)
-  Parameters* p_p2w;  // pos2word mapping (optional)
-  Parameters* p_ptbias; // preterminal bias (used with IMPLICIT_REDUCE_AFTER_SHIFT)
-  Parameters* p_ptW;    // preterminal W (used with IMPLICIT_REDUCE_AFTER_SHIFT)
-  Parameters* p_pbias; // parser state bias
-  Parameters* p_A; // action lstm to parser state
-  Parameters* p_B; // buffer lstm to parser state
-  Parameters* p_S; // stack lstm to parser state
+  LookupParameters* p_r; // relation embeddings
+  LookupParameters* p_p; // pos tag embeddings
   Parameters* p_w2l; // word to LSTM input
+  Parameters* p_p2l; // POS to LSTM input
   Parameters* p_t2l; // pretrained word embeddings to LSTM input
-  Parameters* p_ib; // LSTM input bias
-  Parameters* p_cbias; // composition function bias
-  Parameters* p_p2a;   // parser state to action
-  Parameters* p_action_start;  // action bias
-  Parameters* p_abias;  // action bias
-  Parameters* p_buffer_guard;  // end of buffer
-  Parameters* p_stack_guard;  // end of stack
+  Parameters* p_lb; // LSTM input bias
 
-  Parameters* p_cW;
+  Parameters* p_sent_start;
+  Parameters* p_sent_end;
+
+  Parameters* p_s_input2att;
+  Parameters* p_s_h2att;
+  Parameters* p_s_attbias;
+  Parameters* p_s_att2attexp;
+  Parameters* p_s_att2combo;
+  
+  Parameters* p_b_input2att;
+  Parameters* p_b_h2att;
+  Parameters* p_b_attbias;
+  Parameters* p_b_att2attexp;
+  Parameters* p_b_att2combo;
+
+  Parameters* p_h2combo;
+  Parameters* p_combobias;
+  Parameters* p_combo2rt;
+  Parameters* p_rtbias;
 
   explicit ParserBuilder(Model* model, const unordered_map<unsigned, vector<float>>& pretrained) :
-      stack_lstm(LAYERS, LSTM_INPUT_DIM, HIDDEN_DIM, model),
-      action_lstm(LAYERS, ACTION_DIM, HIDDEN_DIM, model),
-      const_lstm_fwd(LAYERS, LSTM_INPUT_DIM, LSTM_INPUT_DIM, model), // used to compose children of a node into a representation of the node
-      const_lstm_rev(LAYERS, LSTM_INPUT_DIM, LSTM_INPUT_DIM, model), // used to compose children of a node into a representation of the node
+      state_lstm(1, STATE_INPUT_DIM ,STATE_HIDDEN_DIM, model),
+      l2rbuilder(LAYERS, BILSTM_INPUT_DIM, BILSTM_HIDDEN_DIM, model),
+      r2lbuilder(LAYERS, BILSTM_INPUT_DIM, BILSTM_HIDDEN_DIM, model),
       p_w(model->add_lookup_parameters(VOCAB_SIZE, {INPUT_DIM})),
-      p_t(model->add_lookup_parameters(VOCAB_SIZE, {INPUT_DIM})),
-      p_nt(model->add_lookup_parameters(NT_SIZE, {LSTM_INPUT_DIM})),
-      p_ntup(model->add_lookup_parameters(NT_SIZE, {LSTM_INPUT_DIM})),
       p_a(model->add_lookup_parameters(ACTION_SIZE, {ACTION_DIM})),
-      p_pbias(model->add_parameters({HIDDEN_DIM})),
-      p_A(model->add_parameters({HIDDEN_DIM, HIDDEN_DIM})),
-      p_B(model->add_parameters({HIDDEN_DIM, HIDDEN_DIM})),
-      p_S(model->add_parameters({HIDDEN_DIM, HIDDEN_DIM})),
-      p_w2l(model->add_parameters({LSTM_INPUT_DIM, INPUT_DIM})),
-      p_ib(model->add_parameters({LSTM_INPUT_DIM})),
-      p_cbias(model->add_parameters({LSTM_INPUT_DIM})),
-      p_p2a(model->add_parameters({ACTION_SIZE, HIDDEN_DIM})),
-      p_action_start(model->add_parameters({ACTION_DIM})),
-      p_abias(model->add_parameters({ACTION_SIZE})),
+      p_r(model->add_lookup_parameters(ACTION_SIZE, {REL_DIM})),
+      p_w2l(model->add_parameters({BILSTM_INPUT_DIM, INPUT_DIM})),
+      p_lb(model->add_parameters({BILSTM_INPUT_DIM})),
+      p_sent_start(model->add_parameters({BILSTM_INPUT_DIM})),
+      p_sent_end(model->add_parameters({BILSTM_INPUT_DIM})),
+      p_s_input2att(model->add_parameters({ATTENTION_HIDDEN_DIM, BILSTM_HIDDEN_DIM*2})),
+      p_s_h2att(model->add_parameters({ATTENTION_HIDDEN_DIM, STATE_HIDDEN_DIM})),
+      p_s_attbias(model->add_parameters({ATTENTION_HIDDEN_DIM})),
+      p_s_att2attexp(model->add_parameters({ATTENTION_HIDDEN_DIM})),
+      p_s_att2combo(model->add_parameters({STATE_HIDDEN_DIM, BILSTM_HIDDEN_DIM*2})),
+      p_b_input2att(model->add_parameters({ATTENTION_HIDDEN_DIM, BILSTM_HIDDEN_DIM*2})),
+      p_b_h2att(model->add_parameters({ATTENTION_HIDDEN_DIM, STATE_HIDDEN_DIM})),
+      p_b_attbias(model->add_parameters({ATTENTION_HIDDEN_DIM})),
+      p_b_att2attexp(model->add_parameters({ATTENTION_HIDDEN_DIM})),
+      p_b_att2combo(model->add_parameters({STATE_HIDDEN_DIM, BILSTM_HIDDEN_DIM*2})),
+      p_h2combo(model->add_parameters({STATE_HIDDEN_DIM, STATE_HIDDEN_DIM})),
+      p_combobias(model->add_parameters({STATE_HIDDEN_DIM})),
+      p_combo2rt(model->add_parameters({ACTION_SIZE, STATE_HIDDEN_DIM})),
+      p_rtbias(model->add_parameters({ACTION_SIZE})){
 
-      p_buffer_guard(model->add_parameters({LSTM_INPUT_DIM})),
-      p_stack_guard(model->add_parameters({LSTM_INPUT_DIM})),
-
-      p_cW(model->add_parameters({LSTM_INPUT_DIM, LSTM_INPUT_DIM * 2})) {
-    if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-      p_ptbias = model->add_parameters({LSTM_INPUT_DIM}); // preterminal bias (used with IMPLICIT_REDUCE_AFTER_SHIFT)
-      p_ptW = model->add_parameters({LSTM_INPUT_DIM, 2*LSTM_INPUT_DIM});    // preterminal W (used with IMPLICIT_REDUCE_AFTER_SHIFT)
-    }
     if (USE_POS) {
-      p_pos = model->add_lookup_parameters(POS_SIZE, {POS_DIM});
-      p_p2w = model->add_parameters({LSTM_INPUT_DIM, POS_DIM});
+      p_p = model->add_lookup_parameters(POS_SIZE, {POS_DIM});
+      p_p2l = model->add_parameters({BILSTM_INPUT_DIM, POS_DIM});
     }
-    buffer_lstm = new LSTMBuilder(LAYERS, LSTM_INPUT_DIM, HIDDEN_DIM, model);
+//    buffer_lstm = new LSTMBuilder(LAYERS, LSTM_INPUT_DIM, HIDDEN_DIM, model);
     if (pretrained.size() > 0) {
       p_t = model->add_lookup_parameters(VOCAB_SIZE, {PRETRAINED_DIM});
       for (auto it : pretrained)
         p_t->Initialize(it.first, it.second);
-      p_t2l = model->add_parameters({LSTM_INPUT_DIM, PRETRAINED_DIM});
+      p_t2l = model->add_parameters({BILSTM_INPUT_DIM, PRETRAINED_DIM});
     } else {
       p_t = nullptr;
       p_t2l = nullptr;
@@ -190,15 +196,9 @@ static bool IsActionForbidden_Discriminative(const string& a, char prev_a, unsig
     return false;
   }
 
-  if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-    // if a SHIFT has an implicit REDUCE, then only shift after an NT:
-    if (is_shift && prev_a != 'N') return true;
-  }
-
   // be careful with top-level parens- you can only close them if you
   // have fully processed the buffer
   if (nopen_parens == 1 && bsize > 1) {
-    if (IMPLICIT_REDUCE_AFTER_SHIFT && is_shift) return true;
     if (is_reduce) return true;
   }
 
@@ -228,124 +228,178 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
     vector<unsigned> results;
     const bool build_training_graph = correct_actions.size() > 0;
     bool apply_dropout = (DROPOUT && !is_evaluation);
-    stack_lstm.new_graph(*hg);
-    action_lstm.new_graph(*hg);
-    const_lstm_fwd.new_graph(*hg);
-    const_lstm_rev.new_graph(*hg);
-    stack_lstm.start_new_sequence();
-    buffer_lstm->new_graph(*hg);
-    buffer_lstm->start_new_sequence();
-    action_lstm.start_new_sequence();
-    if (apply_dropout) {
-      stack_lstm.set_dropout(DROPOUT);
-      action_lstm.set_dropout(DROPOUT);
-      buffer_lstm->set_dropout(DROPOUT);
-      const_lstm_fwd.set_dropout(DROPOUT);
-      const_lstm_rev.set_dropout(DROPOUT);
-    } else {
-      stack_lstm.disable_dropout();
-      action_lstm.disable_dropout();
-      buffer_lstm->disable_dropout();
-      const_lstm_fwd.disable_dropout();
-      const_lstm_rev.disable_dropout();
-    }
+    
+    l2rbuilder.new_graph(*hg);
+    r2lbuilder.new_graph(*hg);
+    l2rbuilder.start_new_sequence();
+    r2lbuilder.start_new_sequence();
     // variables in the computation graph representing the parameters
-    Expression pbias = parameter(*hg, p_pbias);
-    Expression S = parameter(*hg, p_S);
-    Expression B = parameter(*hg, p_B);
-    Expression A = parameter(*hg, p_A);
-    Expression ptbias, ptW;
-    if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-      ptbias = parameter(*hg, p_ptbias);
-      ptW = parameter(*hg, p_ptW);
-    }
-    Expression p2w;
-    if (USE_POS) {
-      p2w = parameter(*hg, p_p2w);
-    }
-
-    Expression ib = parameter(*hg, p_ib);
-    Expression cbias = parameter(*hg, p_cbias);
+    Expression lb = parameter(*hg, p_lb);
     Expression w2l = parameter(*hg, p_w2l);
+    Expression p2l;
+    if (USE_POS)
+      p2l = parameter(*hg, p_p2l);
     Expression t2l;
-    if (p_t2l)
-      t2l = parameter(*hg, p_t2l);
-    Expression p2a = parameter(*hg, p_p2a);
-    Expression abias = parameter(*hg, p_abias);
-    Expression action_start = parameter(*hg, p_action_start);
-    Expression cW = parameter(*hg, p_cW);
+    if (pretrained.size()>0)
+      t2l = parameter(*hg, p_t2l); 
+    state_lstm.new_graph(*hg);
+    state_lstm.start_new_sequence();
+    //state_lstm.start_new_sequence({zeroes(*hg, {STATE_HIDDEN_DIM}), state_start});
+    
+    Expression sent_start = parameter(*hg, p_sent_start);
+    Expression sent_end = parameter(*hg, p_sent_end);
+    //stack attention
+    Expression s_input2att = parameter(*hg, p_s_input2att);
+    Expression s_h2att = parameter(*hg, p_s_h2att);
+    Expression s_attbias = parameter(*hg, p_s_attbias);
+    Expression s_att2attexp = parameter(*hg, p_s_att2attexp);
+    Expression s_att2combo = parameter(*hg, p_s_att2combo);
 
-    action_lstm.add_input(action_start);
+    //buffer attention
+    Expression b_input2att = parameter(*hg, p_b_input2att);
+    Expression b_h2att = parameter(*hg, p_b_h2att);
+    Expression b_attbias = parameter(*hg, p_b_attbias);
+    Expression b_att2attexp = parameter(*hg, p_b_att2attexp);
+    Expression b_att2combo = parameter(*hg, p_b_att2combo);
 
-    vector<Expression> buffer(sent.size() + 1);  // variables representing word embeddings
+    Expression h2combo = parameter(*hg, p_h2combo);
+    Expression combobias = parameter(*hg, p_combobias);
+    Expression combo2rt = parameter(*hg, p_combo2rt);
+    Expression rtbias = parameter(*hg, p_rtbias);
+    vector<Expression> input_expr;
+    
+	
+    if (apply_dropout) {
+      l2rbuilder.set_dropout(DROPOUT);
+      r2lbuilder.set_dropout(DROPOUT);
+      state_lstm.set_dropout(DROPOUT);
+    } else {
+      l2rbuilder.disable_dropout();
+      r2lbuilder.disable_dropout();
+      state_lstm.disable_dropout();
+    }
+
+    for (unsigned i = 0; i < sent.size(); ++i) {
+      int wordid = sent.raw[i]; // this will be equal to unk at dev/test
+      if (build_training_graph && singletons.size() > wordid && singletons[wordid] && rand01() > 0.5)
+          wordid = sent.unk[i];
+
+      Expression w =lookup(*hg, p_w, wordid);
+      vector<Expression> args = {lb, w2l, w}; // learn embeddings
+      if (USE_POS) { // learn POS tag?
+        Expression p = lookup(*hg, p_p, sent.pos[i]);
+        args.push_back(p2l);
+        args.push_back(p);
+      }
+      if (pretrained.size() > 0 &&  pretrained.count(sent.lc[i])) {  // include fixed pretrained vectors?
+        Expression t = const_lookup(*hg, p_t, sent.lc[i]);
+        args.push_back(t2l);
+        args.push_back(t);
+      }
+      else{
+        args.push_back(t2l);
+        args.push_back(zeroes(*hg,{PRETRAINED_DIM}));
+      }
+      input_expr.push_back(rectify(affine_transform(args)));
+    }
+if(DEBUG)	std::cerr<<"lookup table ok\n";
+    vector<Expression> l2r(sent.size());
+    vector<Expression> r2l(sent.size());
+    Expression l2r_s = l2rbuilder.add_input(sent_start);
+    Expression r2l_e = r2lbuilder.add_input(sent_end);
+    for (unsigned i = 0; i < sent.size(); ++i) {
+      l2r[i] = l2rbuilder.add_input(input_expr[i]);
+      r2l[sent.size() - 1 - i] = r2lbuilder.add_input(input_expr[sent.size()-1-i]);
+    }
+    Expression l2r_e = l2rbuilder.add_input(sent_end);
+    Expression r2l_s = r2lbuilder.add_input(sent_start);
+    vector<Expression> input(sent.size());
+    for (unsigned i = 0; i < sent.size(); ++i) {
+      input[i] = concatenate({l2r[i],r2l[i]});
+    }
+    Expression sent_start_expr = concatenate({l2r_s, r2l_s});
+    Expression sent_end_expr = concatenate({l2r_e, r2l_e});
+if(DEBUG)	std::cerr<<"bilstm ok\n";
+    // dummy symbol to represent the empty buffer
+
     vector<int> bufferi(sent.size() + 1);  // position of the words in the sentence
     // precompute buffer representation from left to right
 
     // in the discriminative model, here we set up the buffer contents
-    for (unsigned i = 0; i < sent.size(); ++i) {
-        int wordid = sent.raw[i]; // this will be equal to unk at dev/test
-        if (build_training_graph && singletons.size() > wordid && singletons[wordid] && rand01() > 0.5)
-          wordid = sent.unk[i];
-        Expression w = lookup(*hg, p_w, wordid);
-
-        vector<Expression> args = {ib, w2l, w}; // learn embeddings
-        if (p_t && pretrained.count(sent.lc[i])) {  // include fixed pretrained vectors?
-          Expression t = const_lookup(*hg, p_t, sent.lc[i]);
-          args.push_back(t2l);
-          args.push_back(t);
-        }
-        if (USE_POS) {
-          args.push_back(p2w);
-          args.push_back(lookup(*hg, p_pos, sent.pos[i]));
-        }
-        buffer[sent.size() - i] = rectify(affine_transform(args));
-        bufferi[sent.size() - i] = i;
-    }
     // dummy symbol to represent the empty buffer
-    buffer[0] = parameter(*hg, p_buffer_guard);
     bufferi[0] = -999;
-    for (auto& b : buffer)
-      buffer_lstm->add_input(b);
-
-    vector<Expression> stack;  // variables representing subtree embeddings
     vector<int> stacki; // position of words in the sentence of head of subtree
-    stack.push_back(parameter(*hg, p_stack_guard));
     stacki.push_back(-999); // not used for anything
     // drive dummy symbol on stack through LSTM
-    stack_lstm.add_input(stack.back());
     vector<int> is_open_paren; // -1 if no nonterminal has a parenthesis open, otherwise index of NT
     is_open_paren.push_back(-1); // corresponds to dummy symbol
     vector<Expression> log_probs;
     string rootword;
+    unsigned stack_buffer_split = 0;
     unsigned action_count = 0;  // incremented at each prediction
     unsigned nt_count = 0; // number of times an NT has been introduced
     vector<unsigned> current_valid_actions;
     int nopen_parens = 0;
     char prev_a = '0';
-    while(stack.size() > 2 || buffer.size() > 1) {
+
+    vector<Expression> l2rhc = l2rbuilder.final_s();
+    vector<Expression> r2lhc = r2lbuilder.final_s();
+
+    vector<Expression> initc;
+    //for(unsigned i = 0; i < LAYERS; i ++){
+      initc.push_back(concatenate({l2rhc.back(),r2lhc.back()}));
+    //}
+
+    //for(unsigned i = 0; i < LAYERS; i ++){
+      initc.push_back(zeroes(*hg, {BILSTM_HIDDEN_DIM*2}));
+    //}
+    state_lstm.start_new_sequence(initc);
+
+    while(stacki.size() > 2 || bufferi.size() > 1) {
       // get list of possible actions for the current parser state
       current_valid_actions.clear();
       for (auto a: possible_actions) {
-        if (IsActionForbidden_Discriminative(adict.Convert(a), prev_a, buffer.size(), stack.size(), nopen_parens))
+        if (IsActionForbidden_Discriminative(adict.Convert(a), prev_a, bufferi.size(), stacki.size(), nopen_parens))
           continue;
         current_valid_actions.push_back(a);
       }
       //cerr << "valid actions = " << current_valid_actions.size() << endl;
 
-      // p_t = pbias + S * slstm + B * blstm + A * almst
-      Expression stack_summary = stack_lstm.back();
-      Expression action_summary = action_lstm.back();
-      Expression buffer_summary = buffer_lstm->back();
-      if (apply_dropout) {
-        stack_summary = dropout(stack_summary, DROPOUT);
-        action_summary = dropout(action_summary, DROPOUT);
-        buffer_summary = dropout(buffer_summary, DROPOUT);
+      Expression prev_h = state_lstm.final_h()[0];
+      vector<Expression> s_att;
+      vector<Expression> s_input;
+      s_att.push_back(tanh(affine_transform({s_attbias, s_input2att, sent_start_expr, s_h2att, prev_h})));
+      s_input.push_back(sent_start_expr);
+      for(unsigned i = 0; i < stack_buffer_split; i ++){
+        s_att.push_back(tanh(affine_transform({s_attbias, s_input2att, input[i], s_h2att, prev_h})));
+        s_input.push_back(input[i]);
       }
-      Expression p_t = affine_transform({pbias, S, stack_summary, B, buffer_summary, A, action_summary});
-      Expression nlp_t = rectify(p_t);
-      //if (build_training_graph) nlp_t = dropout(nlp_t, 0.4);
-      // r_t = abias + p2a * nlp
-      Expression r_t = affine_transform({abias, p2a, nlp_t});
+      Expression s_att_col = transpose(concatenate_cols(s_att));
+      Expression s_attexp = softmax(s_att_col * s_att2attexp);
+
+      Expression s_input_col = concatenate_cols(s_input);
+      Expression s_att_pool = s_input_col * s_attexp;
+
+      vector<Expression> b_att;
+      vector<Expression> b_input;
+      for(unsigned i = stack_buffer_split; i < sent.size(); i ++){
+        b_att.push_back(tanh(affine_transform({b_attbias, b_input2att, input[i], b_h2att, prev_h})));
+        b_input.push_back(input[i]);
+      }
+      b_att.push_back(tanh(affine_transform({b_attbias, b_input2att, sent_end_expr, b_h2att, prev_h})));
+      b_input.push_back(sent_end_expr);
+      Expression b_att_col = transpose(concatenate_cols(b_att));
+      Expression b_attexp = softmax(b_att_col * b_att2attexp);
+
+      Expression b_input_col = concatenate_cols(b_input);
+      Expression b_att_pool = b_input_col * b_attexp;
+
+if(DEBUG)	std::cerr<<"attention ok\n";
+      Expression combo = affine_transform({combobias, h2combo, prev_h, s_att2combo, s_att_pool, b_att2combo, b_att_pool});
+      Expression n_combo = rectify(combo);
+      Expression r_t = affine_transform({rtbias, combo2rt, n_combo});
+if(DEBUG)	std::cerr<<"to action layer ok\n";
+ 
       if (sample && ALPHA != 1.0f) r_t = r_t * ALPHA;
       // adist = log_softmax(r_t, current_valid_actions)
       Expression adiste = log_softmax(r_t, current_valid_actions);
@@ -389,7 +443,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
 
       // add current action to action LSTM
       Expression actione = lookup(*hg, p_a, action);
-      action_lstm.add_input(actione);
+      state_lstm.add_input(concatenate({actione,s_att_pool,b_att_pool}));
 
       // do action
       const string& actionString=adict.Convert(action);
@@ -399,94 +453,41 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       prev_a = ac;
 
       if (ac =='S' && ac2=='H') {  // SHIFT
-        assert(buffer.size() > 1); // dummy symbol means > 1 (not >= 1)
-        if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-          --nopen_parens;
-          int i = is_open_paren.size() - 1;
-          assert(is_open_paren[i] >= 0);
-          Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
-          Expression terminal = buffer.back();
-          Expression c = concatenate({nonterminal, terminal});
-          Expression pt = rectify(affine_transform({ptbias, ptW, c}));
-          stack.pop_back();
-          stacki.pop_back();
-          stack_lstm.rewind_one_step();
-          buffer.pop_back();
-          bufferi.pop_back();
-          buffer_lstm->rewind_one_step();
-          is_open_paren.pop_back();
-          stack_lstm.add_input(pt);
-          stack.push_back(pt);
-          stacki.push_back(999);
-          is_open_paren.push_back(-1);
-        } else {
-          stack.push_back(buffer.back());
-          stack_lstm.add_input(buffer.back());
-          stacki.push_back(bufferi.back());
-          buffer.pop_back();
-          buffer_lstm->rewind_one_step();
-          bufferi.pop_back();
-          is_open_paren.push_back(-1);
-        }
+        assert(bufferi.size() > 1); // dummy symbol means > 1 (not >= 1)
+        stacki.push_back(bufferi.back());
+        bufferi.pop_back();
+        is_open_paren.push_back(-1);
+	stack_buffer_split += 1;
       } else if (ac == 'N') { // NT
         ++nopen_parens;
-        assert(buffer.size() > 1);
+        assert(bufferi.size() > 1);
         auto it = action2NTindex.find(action);
         assert(it != action2NTindex.end());
         int nt_index = it->second;
         nt_count++;
-        Expression nt_embedding = lookup(*hg, p_nt, nt_index);
-        stack.push_back(nt_embedding);
-        stack_lstm.add_input(nt_embedding);
         stacki.push_back(-1);
         is_open_paren.push_back(nt_index);
       } else { // REDUCE
         --nopen_parens;
-        assert(stack.size() > 2); // dummy symbol means > 2 (not >= 2)
+        assert(stacki.size() > 2); // dummy symbol means > 2 (not >= 2)
         // find what paren we are closing
         int i = is_open_paren.size() - 1;
         while(is_open_paren[i] < 0) { --i; assert(i >= 0); }
-        Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
         int nchildren = is_open_paren.size() - i - 1;
         assert(nchildren > 0);
         //cerr << "  number of children to reduce: " << nchildren << endl;
-        vector<Expression> children(nchildren);
-        const_lstm_fwd.start_new_sequence();
-        const_lstm_rev.start_new_sequence();
 
         // REMOVE EVERYTHING FROM THE STACK THAT IS GOING
         // TO BE COMPOSED INTO A TREE EMBEDDING
         for (i = 0; i < nchildren; ++i) {
-          children[i] = stack.back();
           assert (stacki.back() != -1);
           stacki.pop_back();
-          stack.pop_back();
-          stack_lstm.rewind_one_step();
           is_open_paren.pop_back();
         }
 	is_open_paren.pop_back(); // nt symbol
-        assert (stacki.back() == -1);
         stacki.pop_back(); // nonterminal dummy
-        stack.pop_back(); // nonterminal dummy
-        stack_lstm.rewind_one_step(); // nt symbol
 
         // BUILD TREE EMBEDDING USING BIDIR LSTM
-        const_lstm_fwd.add_input(nonterminal);
-        const_lstm_rev.add_input(nonterminal);
-        for (i = 0; i < nchildren; ++i) {
-          const_lstm_fwd.add_input(children[i]);
-          const_lstm_rev.add_input(children[nchildren - i - 1]);
-        }
-        Expression cfwd = const_lstm_fwd.back();
-        Expression crev = const_lstm_rev.back();
-        if (apply_dropout) {
-          cfwd = dropout(cfwd, DROPOUT);
-          crev = dropout(crev, DROPOUT);
-        }
-        Expression c = concatenate({cfwd, crev});
-        Expression composed = rectify(affine_transform({cbias, cW, c}));
-        stack_lstm.add_input(composed);
-        stack.push_back(composed);
         stacki.push_back(999); // who knows, should get rid of this
         is_open_paren.push_back(-1); // we just closed a paren at this position
       }
@@ -495,9 +496,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       cerr << "Unexecuted actions remain but final state reached!\n";
       abort();
     }
-    assert(stack.size() == 2); // guard symbol, root
     assert(stacki.size() == 2);
-    assert(buffer.size() == 1); // guard symbol
     assert(bufferi.size() == 1);
     Expression tot_neglogprob = -sum(log_probs);
     assert(tot_neglogprob.pg != nullptr);
@@ -551,305 +550,7 @@ static bool all_complete(const vector<ParserState>& pq) {
   return true;
 }
 
-
-// log_prob_parser with beam-search
-// *** if correct_actions is empty, this runs greedy decoding ***
-// returns parse actions for input sentence (in training just returns the reference)
-// this lets us use pretrained embeddings, when available, for words that were OOV in the
-// parser training data
-// set sample=true to sample rather than max
-vector<unsigned> log_prob_parser_beam(ComputationGraph* hg,
-                     const parser::Sentence& sent,
-                     const vector<int>& correct_actions,
-                     double *right,
-		     unsigned beam_size,
-                     bool sample = false) {
-    vector<unsigned> results;
-    const bool build_training_graph = correct_actions.size() > 0;
-    stack_lstm.new_graph(*hg);
-    action_lstm.new_graph(*hg);
-    const_lstm_fwd.new_graph(*hg);
-    const_lstm_rev.new_graph(*hg);
-    stack_lstm.start_new_sequence();
-    buffer_lstm->new_graph(*hg);
-    buffer_lstm->start_new_sequence();
-    action_lstm.start_new_sequence();
-    // variables in the computation graph representing the parameters
-    Expression pbias = parameter(*hg, p_pbias);
-    Expression S = parameter(*hg, p_S);
-    Expression B = parameter(*hg, p_B);
-    Expression A = parameter(*hg, p_A);
-    Expression ptbias, ptW;
-    if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-      ptbias = parameter(*hg, p_ptbias);
-      ptW = parameter(*hg, p_ptW);
-    }
-    Expression p2w;
-    if (USE_POS) {
-      p2w = parameter(*hg, p_p2w);
-    }
-
-    Expression ib = parameter(*hg, p_ib);
-    Expression cbias = parameter(*hg, p_cbias);
-    Expression w2l = parameter(*hg, p_w2l);
-    Expression t2l;
-    if (p_t2l)
-      t2l = parameter(*hg, p_t2l);
-    Expression p2a = parameter(*hg, p_p2a);
-    Expression abias = parameter(*hg, p_abias);
-    Expression action_start = parameter(*hg, p_action_start);
-    Expression cW = parameter(*hg, p_cW);
-
-    action_lstm.add_input(action_start);
-
-    vector<Expression> buffer(sent.size() + 1);  // variables representing word embeddings
-    vector<int> bufferi(sent.size() + 1);  // position of the words in the sentence
-    // precompute buffer representation from left to right
-
-    // in the discriminative model, here we set up the buffer contents
-    for (unsigned i = 0; i < sent.size(); ++i) {
-        int wordid = sent.raw[i]; // this will be equal to unk at dev/test
-        if (build_training_graph && singletons.size() > wordid && singletons[wordid] && rand01() > 0.5)
-          wordid = sent.unk[i];
-        Expression w = lookup(*hg, p_w, wordid);
-
-        vector<Expression> args = {ib, w2l, w}; // learn embeddings
-        if (p_t && pretrained.count(sent.lc[i])) {  // include fixed pretrained vectors?
-          Expression t = const_lookup(*hg, p_t, sent.lc[i]);
-          args.push_back(t2l);
-          args.push_back(t);
-        }
-        if (USE_POS) {
-          args.push_back(p2w);
-          args.push_back(lookup(*hg, p_pos, sent.pos[i]));
-        }
-        buffer[sent.size() - i] = rectify(affine_transform(args));
-        bufferi[sent.size() - i] = i;
-    }
-    // dummy symbol to represent the empty buffer
-    buffer[0] = parameter(*hg, p_buffer_guard);
-    bufferi[0] = -999;
-    for (auto& b : buffer)
-      buffer_lstm->add_input(b);
-
-    vector<Expression> stack;  // variables representing subtree embeddings
-    vector<int> stacki; // position of words in the sentence of head of subtree
-    stack.push_back(parameter(*hg, p_stack_guard));
-    stacki.push_back(-999); // not used for anything
-    // drive dummy symbol on stack through LSTM
-    stack_lstm.add_input(stack.back());
-    vector<int> is_open_paren; // -1 if no nonterminal has a parenthesis open, otherwise index of NT
-    is_open_paren.push_back(-1); // corresponds to dummy symbol
-    vector<Expression> log_probs;
-    string rootword;
-    unsigned action_count = 0;  // incremented at each prediction
-    unsigned nt_count = 0; // number of times an NT has been introduced
-    vector<unsigned> current_valid_actions;
-    int nopen_parens = 0;
-    char prev_a = '0';
-
-    ParserState init;
-
-    init.stack_lstm = stack_lstm;
-    init.buffer_lstm = buffer_lstm;
-    init.action_lstm = action_lstm;
-    init.const_lstm_fwd = const_lstm_fwd;
-    init.const_lstm_rev = const_lstm_rev;
-    init.buffer = buffer;
-    init.bufferi = bufferi;
-    init.stack = stack;
-    init.stacki = stacki;
-    init.results = results;
-    init.log_probs = log_probs;
-    init.score = 0;
-    init.action_count=0;
-    init.nopen_parens=nopen_parens;
-    init.prev_a=prev_a;
-    if (init.stacki.size() ==1 && init.bufferi.size() == 1) { assert(!"bad0"); }
-
-    vector<ParserState> pq;
-    pq.push_back(init);
-    vector<ParserState> completed;
-
-     
-    while (pq.size()>0) {
-      const ParserState cur = pq.back();
-      pq.pop_back();
-      if (cur.stack.size() == 2 && cur.buffer.size() == 1) {
-        completed.push_back(cur);
-        if (completed.size() == beam_size) break;
-        continue;
-      }
-    //while(stack.size() > 2 || buffer.size() > 1) {
-      // get list of possible actions for the current parser state
-      current_valid_actions.clear();
-      for (auto a: possible_actions) {
-        if (IsActionForbidden_Discriminative(adict.Convert(a), cur.prev_a, cur.buffer.size(), cur.stack.size(), cur.nopen_parens))
-          continue;
-        current_valid_actions.push_back(a);
-      }
-      //UNTIL HERE BEAM SEARCH
-      //cerr << "valid actions = " << current_valid_actions.size() << endl;
-
-      // p_t = pbias + S * slstm + B * blstm + A * almst
-      Expression p_t = affine_transform({pbias, S, stack_lstm.back(), B, buffer_lstm->back(), A, action_lstm.back()});
-      Expression nlp_t = rectify(p_t);
-      //if (build_training_graph) nlp_t = dropout(nlp_t, 0.4);
-      // r_t = abias + p2a * nlp
-      Expression r_t = affine_transform({abias, p2a, nlp_t});
-      if (sample && ALPHA != 1.0f) r_t = r_t * ALPHA;
-      // adist = log_softmax(r_t, current_valid_actions)
-      Expression adiste = log_softmax(r_t, current_valid_actions);
-      vector<float> adist = as_vector(hg->incremental_forward());
-      double best_score = adist[current_valid_actions[0]];
-      unsigned model_action = current_valid_actions[0];
-      if (sample) {
-        double p = rand01();
-        assert(current_valid_actions.size() > 0);
-        unsigned w = 0;
-        for (; w < current_valid_actions.size(); ++w) {
-          p -= exp(adist[current_valid_actions[w]]);
-          if (p < 0.0) { break; }
-        }
-        if (w == current_valid_actions.size()) w--;
-        model_action = current_valid_actions[w];
-      } else { // max
-        for (unsigned i = 1; i < current_valid_actions.size(); ++i) {
-          if (adist[current_valid_actions[i]] > best_score) {
-            best_score = adist[current_valid_actions[i]];
-            model_action = current_valid_actions[i];
-          }
-        }
-      }
-      unsigned action = model_action;
-      if (build_training_graph) {  // if we have reference actions (for training) use the reference action
-        if (action_count >= correct_actions.size()) {
-          cerr << "Correct action list exhausted, but not in final parser state.\n";
-          abort();
-        }
-        action = correct_actions[action_count];
-        if (model_action == action) { (*right)++; }
-      } else {
-        //cerr << "Chosen action: " << adict.Convert(action) << endl;
-      }
-      //cerr << "prob ="; for (unsigned i = 0; i < adist.size(); ++i) { cerr << ' ' << adict.Convert(i) << ':' << adist[i]; }
-      //cerr << endl;
-      ++action_count;
-      log_probs.push_back(pick(adiste, action));
-      results.push_back(action);
-
-      // add current action to action LSTM
-      Expression actione = lookup(*hg, p_a, action);
-      action_lstm.add_input(actione);
-
-      // do action
-      const string& actionString=adict.Convert(action);
-      //cerr << "ACT: " << actionString << endl;
-      const char ac = actionString[0];
-      const char ac2 = actionString[1];
-      prev_a = ac;
-
-      if (ac =='S' && ac2=='H') {  // SHIFT
-        assert(buffer.size() > 1); // dummy symbol means > 1 (not >= 1)
-        if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-          --nopen_parens;
-          int i = is_open_paren.size() - 1;
-          assert(is_open_paren[i] >= 0);
-          Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
-          Expression terminal = buffer.back();
-          Expression c = concatenate({nonterminal, terminal});
-          Expression pt = rectify(affine_transform({ptbias, ptW, c}));
-          stack.pop_back();
-          stacki.pop_back();
-          stack_lstm.rewind_one_step();
-          buffer.pop_back();
-          bufferi.pop_back();
-          buffer_lstm->rewind_one_step();
-          is_open_paren.pop_back();
-          stack_lstm.add_input(pt);
-          stack.push_back(pt);
-          stacki.push_back(999);
-          is_open_paren.push_back(-1);
-        } else {
-          stack.push_back(buffer.back());
-          stack_lstm.add_input(buffer.back());
-          stacki.push_back(bufferi.back());
-          buffer.pop_back();
-          buffer_lstm->rewind_one_step();
-          bufferi.pop_back();
-          is_open_paren.push_back(-1);
-        }
-      } else if (ac == 'N') { // NT
-        ++nopen_parens;
-        assert(buffer.size() > 1);
-        auto it = action2NTindex.find(action);
-        assert(it != action2NTindex.end());
-        int nt_index = it->second;
-        nt_count++;
-        Expression nt_embedding = lookup(*hg, p_nt, nt_index);
-        stack.push_back(nt_embedding);
-        stack_lstm.add_input(nt_embedding);
-        stacki.push_back(-1);
-        is_open_paren.push_back(nt_index);
-      } else { // REDUCE
-        --nopen_parens;
-        assert(stack.size() > 2); // dummy symbol means > 2 (not >= 2)
-        // find what paren we are closing
-        int i = is_open_paren.size() - 1;
-        while(is_open_paren[i] < 0) { --i; assert(i >= 0); }
-        Expression nonterminal = lookup(*hg, p_ntup, is_open_paren[i]);
-        int nchildren = is_open_paren.size() - i - 1;
-        assert(nchildren > 0);
-        //cerr << "  number of children to reduce: " << nchildren << endl;
-        vector<Expression> children(nchildren);
-        const_lstm_fwd.start_new_sequence();
-        const_lstm_rev.start_new_sequence();
-
-        // REMOVE EVERYTHING FROM THE STACK THAT IS GOING
-        // TO BE COMPOSED INTO A TREE EMBEDDING
-        for (i = 0; i < nchildren; ++i) {
-          children[i] = stack.back();
-          assert (stacki.back() != -1);
-          stacki.pop_back();
-          stack.pop_back();
-          stack_lstm.rewind_one_step();
-          is_open_paren.pop_back();
-        }
-        is_open_paren.pop_back(); // nt symbol
-        assert (stacki.back() == -1);
-        stacki.pop_back(); // nonterminal dummy
-        stack.pop_back(); // nonterminal dummy
-        stack_lstm.rewind_one_step(); // nt symbol
-
-        // BUILD TREE EMBEDDING USING BIDIR LSTM
-        const_lstm_fwd.add_input(nonterminal);
-        const_lstm_rev.add_input(nonterminal);
-        for (i = 0; i < nchildren; ++i) {
-          const_lstm_fwd.add_input(children[i]);
-          const_lstm_rev.add_input(children[nchildren - i - 1]);
-        }
-        Expression c = concatenate({const_lstm_fwd.back(), const_lstm_rev.back()});
-        Expression composed = rectify(affine_transform({cbias, cW, c}));
-        stack_lstm.add_input(composed);
-        stack.push_back(composed);
-        stacki.push_back(999); // who knows, should get rid of this
-        is_open_paren.push_back(-1); // we just closed a paren at this position
-      }
-    }
-    if (build_training_graph && action_count != correct_actions.size()) {
-      cerr << "Unexecuted actions remain but final state reached!\n";
-      abort();
-    }
-    assert(stack.size() == 2); // guard symbol, root
-    assert(stacki.size() == 2);
-    assert(buffer.size() == 1); // guard symbol
-    assert(bufferi.size() == 1);
-    Expression tot_neglogprob = -sum(log_probs);
-    assert(tot_neglogprob.pg != nullptr);
-    return results;
-  }
 };
-
 void signal_callback_handler(int /* signum */) {
   if (requested_stop) {
     cerr << "\nReceived SIGINT again, quitting.\n";
@@ -869,17 +570,21 @@ int main(int argc, char** argv) {
 
   po::variables_map conf;
   InitCommandLine(argc, argv, &conf);
-  IMPLICIT_REDUCE_AFTER_SHIFT = conf.count("explicit_terminal_reduce") == 0;
   USE_POS = conf.count("use_pos_tags");
   if (conf.count("dropout"))
     DROPOUT = conf["dropout"].as<float>();
   LAYERS = conf["layers"].as<unsigned>();
   INPUT_DIM = conf["input_dim"].as<unsigned>();
   PRETRAINED_DIM = conf["pretrained_dim"].as<unsigned>();
-  HIDDEN_DIM = conf["hidden_dim"].as<unsigned>();
+  BILSTM_INPUT_DIM = conf["bilstm_input_dim"].as<unsigned>();
+  BILSTM_HIDDEN_DIM = conf["bilstm_hidden_dim"].as<unsigned>();
+  STATE_HIDDEN_DIM = BILSTM_HIDDEN_DIM * 2;
+  ATTENTION_HIDDEN_DIM = conf["attention_hidden_dim"].as<unsigned>();
+
   ACTION_DIM = conf["action_dim"].as<unsigned>();
-  LSTM_INPUT_DIM = conf["lstm_input_dim"].as<unsigned>();
   POS_DIM = conf["pos_dim"].as<unsigned>();
+  STATE_INPUT_DIM = ACTION_DIM + ATTENTION_HIDDEN_DIM;
+
   if (conf.count("train") && conf.count("dev_data") == 0) {
     cerr << "You specified --train but did not specify --dev_data FILE\n";
     return 1;
@@ -896,12 +601,15 @@ int main(int argc, char** argv) {
   ostringstream os;
   os << "ntparse"
      << (USE_POS ? "_pos" : "")
-     << '_' << IMPLICIT_REDUCE_AFTER_SHIFT
      << '_' << LAYERS
      << '_' << INPUT_DIM
-     << '_' << HIDDEN_DIM
      << '_' << ACTION_DIM
-     << '_' << LSTM_INPUT_DIM
+     << '_' << POS_DIM
+     << '_' << REL_DIM
+     << '_' << BILSTM_INPUT_DIM
+     << '_' << BILSTM_HIDDEN_DIM
+     << '_' << ATTENTION_HIDDEN_DIM
+     << '_' << STATE_HIDDEN_DIM
      << "-pid" << getpid() << ".params";
   const string fname = os.str();
   cerr << "PARAMETER FILE: " << fname << endl;
@@ -972,8 +680,9 @@ int main(int argc, char** argv) {
   //TRAINING
   if (conf.count("train")) {
     signal(SIGINT, signal_callback_handler);
-    SimpleSGDTrainer sgd(&model);
-    //AdamTrainer sgd(&model);
+	SimpleSGDTrainer sgd(&model);
+
+	//AdamTrainer sgd(&model);
     //MomentumSGDTrainer sgd(&model);
     //sgd.eta_decay = 0.08;
     sgd.eta_decay = 0.05;
@@ -1057,16 +766,12 @@ int main(int argc, char** argv) {
              if (adict.Convert(a)[0] == 'N') {
                out << '(' << ntermdict.Convert(action2NTindex.find(a)->second) << ' ';
              } else if (adict.Convert(a)[0] == 'S') {
-               if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                 out << termdict.Convert(sentence.raw[ti++]) << ") ";
-               } else {
                  if (true) {
                    string preterminal = "XX";
                    out << '(' << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ") ";
                  } else { // use this branch to surpress preterminals
                    out << termdict.Convert(sentence.raw[ti++]) << ' ';
                  }
-               }
              } else out << ") ";
            }
            out << endl;
@@ -1153,17 +858,12 @@ int main(int argc, char** argv) {
                if (adict.Convert(a)[0] == 'N') {
                  cout << " (" << ntermdict.Convert(action2NTindex.find(a)->second);
                } else if (adict.Convert(a)[0] == 'S') {
-                 if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                   cout << termdict.Convert(sentence.raw[ti++]) << ")";
-                 } else {
                    if (!sample) {
-                     //string preterminal = "XX";
-                     //cout << " (" << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ")";
-                     cout << ' ' << termdict.Convert(sentence.raw[ti++]);
+                     string preterminal = "XX";
+                     cout << " (" << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ")";
                    } else { // use this branch to surpress preterminals
                      cout << ' ' << termdict.Convert(sentence.raw[ti++]);
                    }
-                 }
                } else cout << ')';
              }
              cout << endl;
@@ -1190,16 +890,12 @@ int main(int argc, char** argv) {
              if (adict.Convert(a)[0] == 'N') {
                out << '(' << ntermdict.Convert(action2NTindex.find(a)->second) << ' ';
              } else if (adict.Convert(a)[0] == 'S') {
-               if (IMPLICIT_REDUCE_AFTER_SHIFT) {
-                 out << termdict.Convert(sentence.raw[ti++]) << ") ";
-               } else {
                  if (true) {
                    string preterminal = "XX";
                    out << '(' << preterminal << ' ' << termdict.Convert(sentence.raw[ti++]) << ") ";
                  } else { // use this branch to surpress preterminals
                    out << termdict.Convert(sentence.raw[ti++]) << ' ';
                  }
-               }
              } else out << ") ";
            }
            out << endl;

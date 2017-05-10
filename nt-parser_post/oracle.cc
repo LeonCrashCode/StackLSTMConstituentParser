@@ -44,10 +44,10 @@ void TopDownOracle::load_oracle(const string& file, bool is_training) {
   cerr << "Loading top-down oracle from " << file << " [" << (is_training ? "training" : "non-training") << "] ...\n";
   cnn::compressed_ifstream in(file.c_str());
   assert(in);
-  const string kREDUCE = "REDUCE";
   const string kSHIFT = "SHIFT";
-  const int kREDUCE_INT = ad->Convert("REDUCE");
+  const string kTERM = "TERM";
   const int kSHIFT_INT = ad->Convert("SHIFT");
+  const int kTERM_INT = ad->Convert("TERM");
   int lc = 0;
   string line;
   vector<int> cur_acts;
@@ -56,6 +56,7 @@ void TopDownOracle::load_oracle(const string& file, bool is_training) {
     //cerr << "line number = " << lc << endl;
     cur_acts.clear();
     if (line.size() == 0 || (line[0] == '!' && line[1] == '#')) continue;
+    //if (line.size() == 0 || line[0] == '#') continue;
     sents.resize(sents.size() + 1);
     auto& cur_sent = sents.back();
     if (is_training) {  // at training time, we load both "UNKified" versions of the data, and raw versions
@@ -86,16 +87,16 @@ void TopDownOracle::load_oracle(const string& file, bool is_training) {
       //cerr << "line number = " << lc << endl;
       if (line.size() == 0) break;
       assert(line.find(' ') == string::npos);
-      if (line == kREDUCE) {
-        cur_acts.push_back(kREDUCE_INT);
-      } else if (line.find("NT(") == 0) {
-        // Convert NT
-        nd->Convert(line.substr(3, line.size() - 4));
-        // NT(X) is put into the actions list as NT(X)
-        cur_acts.push_back(ad->Convert(line));
+      if (line.find("REDUCE(")==0) {
+	auto lb = line.find("(");
+	auto rb = line.find("-");
+	nd->Convert(line.substr(lb+1, rb-lb-1));
+	cur_acts.push_back(ad->Convert(line));
       } else if (line == kSHIFT) {
         cur_acts.push_back(kSHIFT_INT);
         termc++;
+      } else if (line == kTERM){
+	cur_acts.push_back(kTERM_INT);
       } else {
         cerr << "Malformed input in line " << lc << endl;
         abort();
@@ -120,8 +121,10 @@ void TopDownOracleGen::load_oracle(const string& file) {
   assert(in);
   const string kREDUCE = "REDUCE";
   const string kSHIFT = "SHIFT";
+  const string kTERM = "TERM";
   const int kREDUCE_INT = ad->Convert("REDUCE");
   const int kSHIFT_INT = ad->Convert("SHIFT");
+  const int kTERM_INT = ad->Convert("TERM");
   int lc = 0;
   string line;
   vector<int> cur_acts;
@@ -156,6 +159,8 @@ void TopDownOracleGen::load_oracle(const string& file) {
       } else if (line == kSHIFT) {
         cur_acts.push_back(kSHIFT_INT);
         termc++;
+      } else if (line == kTERM) {
+        cur_acts.push_back(kTERM_INT);
       }else {
         cerr << "Malformed input in line " << lc << endl;
         abort();
@@ -178,8 +183,66 @@ void TopDownOracleGen2::load_oracle(const string& file) {
   cerr << "Loading top-down generative oracle from " << file << endl;
   cnn::compressed_ifstream in(file.c_str());
   assert(in);
+  const string kREDUCE = "REDUCE";
+  const string kSHIFT = "SHIFT";
+  const string kTERM = "TERM";
   const int kREDUCE_INT = ad->Convert("REDUCE");
   const int kSHIFT_INT = ad->Convert("SHIFT");
+  const int kTERM_INT = ad->Convert("TERM");
+  int lc = 0;
+  string line;
+  vector<int> cur_acts;
+  while(getline(in, line)) {
+    ++lc;
+    sents.push_back(Sentence());
+    auto& raw = sents.back().raw;
+    //cerr << "line number = " << lc << endl;
+    cur_acts.clear();
+    int termc = 0;
+    while(getline(in, line)) {
+      ++lc;
+      //cerr << "line number = " << lc << endl;
+      if (line.size() == 0) break;
+      if (line == kREDUCE) {
+        cur_acts.push_back(kREDUCE_INT);
+      } else if (line.find("NT(") == 0) {
+        // Convert NT
+        nd->Convert(line.substr(3, line.size() - 4));
+	// NT(X) is put into the actions list as NT(X)
+        cur_acts.push_back(ad->Convert(line));
+      } else if (line == kSHIFT) {
+        cur_acts.push_back(kSHIFT_INT);
+        termc++;
+      } else if (line == kTERM) {
+        cur_acts.push_back(kTERM_INT);
+      } else {
+	cur_acts.push_back(kSHIFT_INT);	
+	termc++;
+	int term = d->Convert(line.substr(line.find(' ')+1));
+	raw.push_back(term);
+      }
+    }
+    actions.push_back(cur_acts);
+    if (termc != sents.back().size()) {
+      cerr << "Mismatched number of tokens and SHIFTs in oracle before line " << lc << endl;
+      abort();
+    }
+  }
+  cerr << "Loaded " << sents.size() << " sentences\n";
+  cerr << "    cumulative      action vocab size: " << ad->size() << endl;
+  cerr << "    cumulative    terminal vocab size: " << d->size() << endl;
+  cerr << "    cumulative nonterminal vocab size: " << nd->size() << endl;
+  cerr << "    cumulative         pos vocab size: " << pd->size() << endl;
+}
+
+
+/*void TopDownOracleGen2::load_oracle(const string& file) {
+  cerr << "Loading top-down generative oracle from " << file << endl;
+  cnn::compressed_ifstream in(file.c_str());
+  assert(in);
+  const int kREDUCE_INT = ad->Convert("REDUCE");
+  const int kSHIFT_INT = ad->Convert("SHIFT");
+  const int kTERM_INT = ad->Convert("TERM");
   int lc = 0;
   string line;
   vector<int> cur_acts;
@@ -228,6 +291,7 @@ void TopDownOracleGen2::load_oracle(const string& file) {
       cur_acts.push_back(kSHIFT_INT);
       i = end;
     }
+    cur_acts.push_back(kTERM_INT);
     sents.back().pos = sents.back().lc = sents.back().unk = sents.back().raw;
     actions.push_back(cur_acts);
   }
@@ -238,5 +302,5 @@ void TopDownOracleGen2::load_oracle(const string& file) {
   cerr << "    cumulative nonterminal vocab size: " << nd->size() << endl;
   cerr << "    cumulative         pos vocab size: " << pd->size() << endl;
 }
-
+*/
 } // namespace parser
