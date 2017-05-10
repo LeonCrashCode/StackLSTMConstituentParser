@@ -1037,7 +1037,7 @@ int main(int argc, char** argv) {
         double right = 0;
         double dwords = 0;
         ostringstream os;
-        os << "/tmp/parser_dev_eval." << getpid() << ".txt";
+        os << "parser_dev_eval." << getpid() << ".txt";
         const string pfx = os.str();
         ofstream out(pfx.c_str());
         auto t_start = chrono::high_resolution_clock::now();
@@ -1112,9 +1112,24 @@ int main(int argc, char** argv) {
           cerr << "  new best...writing model to " << fname << " ...\n";
           best_dev_err = err;
 	  bestf1=newfmeasure;
-          ofstream out(fname);
+	  ostringstream part_os;
+          part_os << "ntparse"
+              << (USE_POS ? "_pos" : "")
+              << '_' << IMPLICIT_REDUCE_AFTER_SHIFT
+              << '_' << LAYERS
+              << '_' << INPUT_DIM
+              << '_' << HIDDEN_DIM
+              << '_' << ACTION_DIM
+              << '_' << LSTM_INPUT_DIM
+              << "-pid" << getpid()
+              << "-part" << (tot_seen/corpus.size()) << ".params";
+
+          const string part = part_os.str();
+
+          ofstream out("model/"+part);
           boost::archive::text_oarchive oa(out);
           oa << model;
+
           system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
           // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.

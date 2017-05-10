@@ -825,7 +825,10 @@ int main(int argc, char** argv) {
         double trs = 0;
         double right = 0;
         double dwords = 0;
-        ofstream out("dev.act");
+	ostringstream os;
+        os << "parser_dev_eval." << getpid() << ".txt";
+        const string pfx = os.str();
+        ofstream out(pfx.c_str());
         auto t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < dev_size; ++sii) {
            const auto& sentence=dev_corpus.sents[sii];
@@ -850,16 +853,16 @@ int main(int argc, char** argv) {
         out.close();
         double err = (trs - right) / trs;
 
-	std::string command_2="python post2tree.py dev.act " + conf["dev_data"].as<string>() + " > dev.binary" ;
+	std::string command_2="python post2tree.py "+pfx+ " " + conf["dev_data"].as<string>() + " > "+pfx+".binary" ;
 	const char* cmd_2=command_2.c_str();
 	cerr<<system(cmd_2)<<"\n";
 
-	std::string command_1="python unbinarize.py dev.binary > dev.eval" ;
+	std::string command_1="python unbinarize.py "+ pfx+".binary" +" > "+pfx+".eval" ;
         const char* cmd_1=command_1.c_str();
         cerr<<system(cmd_1)<<"\n";
 
         //parser::EvalBResults res = parser::Evaluate("foo", pfx);
-	std::string command="python remove_dev_unk.py "+ corpus.devdata +" dev.eval > evaluable.txt";
+	std::string command="python remove_dev_unk.py "+ corpus.devdata + " "+pfx+".eval "+" > evaluable.txt";
 	const char* cmd=command.c_str();
 	system(cmd);
 
@@ -910,7 +913,7 @@ int main(int argc, char** argv) {
           ofstream out("model/"+part);
           boost::archive::text_oarchive oa(out);
           oa << model;
-          system("cp dev.eval dev.eval.best");
+	  system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
           // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.
           /*if (!softlinkCreated) {
