@@ -993,6 +993,7 @@ int main(int argc, char** argv) {
     double best_dev_err = 9e99;
     double bestf1=0.0;
     //cerr << "TRAINING STARTED AT: " << put_time(localtime(&time_start), "%c %Z") << endl;
+    vector<string> model_path;
     while(!requested_stop) {
       ++iter;
       auto time_start = chrono::system_clock::now();
@@ -1131,9 +1132,18 @@ int main(int argc, char** argv) {
           oa << model;
 
           system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
-          // Create a soft link to the most recent model in order to make it
+          
+	  if(model_path.size() == 5){
+		const string p = model_path[0];
+	  	system((string("rm ")+p).c_str());
+		for(unsigned i = 0; i < 4; i ++){
+			model_path[i] = model_path[i+1];
+		}
+	  }
+	  model_path.push_back("model/"+part);
+	  // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.
-          if (!softlinkCreated) {
+          /*if (!softlinkCreated) {
             string softlink = " latest_model";
             if (system((string("rm -f ") + softlink).c_str()) == 0 && 
                 system((string("ln -s ") + fname + softlink).c_str()) == 0) {
@@ -1141,7 +1151,7 @@ int main(int argc, char** argv) {
                    << " for convenience." << endl;
             }
             softlinkCreated = true;
-          }
+          }*/
         }
       }
     }

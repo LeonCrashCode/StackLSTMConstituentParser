@@ -781,6 +781,7 @@ int main(int argc, char** argv) {
     int iter = -1;
     double best_dev_err = 9e99;
     double bestf1=0.0;
+    vector<string> model_path;
     //cerr << "TRAINING STARTED AT: " << put_time(localtime(&time_start), "%c %Z") << endl;
     while(!requested_stop) {
       ++iter;
@@ -914,6 +915,14 @@ int main(int argc, char** argv) {
           boost::archive::text_oarchive oa(out);
           oa << model;
 	  system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
+	  if(model_path.size() == 5){
+                const string p = model_path[0];
+                system((string("rm ")+p).c_str());
+                for(unsigned i = 0; i < 4; i ++){
+                        model_path[i] = model_path[i+1];
+                }
+          }
+	  model_path.push_back("model/"+part);
           // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.
           /*if (!softlinkCreated) {

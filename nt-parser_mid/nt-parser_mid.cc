@@ -186,7 +186,7 @@ static bool IsActionForbidden_Discriminative(const string& a, char prev_a, unsig
   bool is_term = (a[0] == 'T');
   assert(is_shift || is_reduce || is_nt || is_term) ;
   static const unsigned MAX_OPEN_NTS = 100;
-  static const unsigned MAX_UNARY = 3;
+  static const unsigned MAX_UNARY = 3; //2 for chinese
 //  if (is_nt && nopen_parens > MAX_OPEN_NTS) return true;
   if (is_term){
     if(ssize == 2 && bsize == 1 && prev_a == 'R') return false;
@@ -938,7 +938,7 @@ void signal_callback_handler(int /* signum */) {
 }
 
 int main(int argc, char** argv) {
-  cnn::Initialize(argc, argv);//, 1989121011);
+  cnn::Initialize(argc, argv, 1989121011);
 
   cerr << "COMMAND LINE:"; 
   for (unsigned i = 0; i < static_cast<unsigned>(argc); ++i) cerr << ' ' << argv[i];
@@ -1071,6 +1071,7 @@ int main(int argc, char** argv) {
     int iter = -1;
     double best_dev_err = 9e99;
     double bestf1=0.0;
+    vector<string> model_path;
     //cerr << "TRAINING STARTED AT: " << put_time(localtime(&time_start), "%c %Z") << endl;
     while(!requested_stop) {
       ++iter;
@@ -1115,7 +1116,10 @@ int main(int argc, char** argv) {
         double trs = 0;
         double right = 0;
         double dwords = 0;
-        ofstream out("dev.act");
+        ostringstream os;
+        os << "parser_dev_eval." << getpid() << ".txt";
+        const string pfx = os.str();
+        ofstream out(pfx.c_str());
         auto t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < dev_size; ++sii) {
            const auto& sentence=dev_corpus.sents[sii];
@@ -1140,12 +1144,12 @@ int main(int argc, char** argv) {
         out.close();
         double err = (trs - right) / trs;
 
-	std::string command_1="python mid2tree.py dev.act " + conf["dev_data"].as<string>() + " > dev.eval" ;
+	std::string command_1="python mid2tree.py  "+pfx+" " + conf["dev_data"].as<string>() + " > "+pfx+".eval" ;
 	const char* cmd_1=command_1.c_str();
 	cerr<<system(cmd_1)<<"\n";
 
         //parser::EvalBResults res = parser::Evaluate("foo", pfx);
-	std::string command="python remove_dev_unk.py "+ corpus.devdata +" dev.eval > evaluable.txt";
+	std::string command="python remove_dev_unk.py "+ corpus.devdata +" "+pfx+".eval"+" > evaluable.txt";
 	const char* cmd=command.c_str();
 	system(cmd);
 
@@ -1196,8 +1200,16 @@ int main(int argc, char** argv) {
           ofstream out("model/"+part);
           boost::archive::text_oarchive oa(out);
           oa << model;
-          system("cp dev.eval dev.eval.best");
-          // Create a soft link to the most recent model in order to make it
+          system((string("cp ") + pfx + string(" ") + pfx + string(".best")).c_str());
+	  if(model_path.size() == 5){
+                const string p = model_path[0];
+                system((string("rm ")+p).c_str());
+                for(unsigned i = 0; i < 4; i ++){
+                        model_path[i] = model_path[i+1];
+                }
+          }
+ 	  model_path.push_back("model/"+part);
+	  // Create a soft link to the most recent model in order to make it
           // easier to refer to it in a shell script.
           /*if (!softlinkCreated) {
             string softlink = " latest_model";
