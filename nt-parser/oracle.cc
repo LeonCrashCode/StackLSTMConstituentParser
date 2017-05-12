@@ -55,7 +55,7 @@ void TopDownOracle::load_oracle(const string& file, bool is_training) {
     ++lc;
     //cerr << "line number = " << lc << endl;
     cur_acts.clear();
-    if (line.size() == 0 || (line[0] == '!' && line[1] == '#')) continue;
+    if (line.size() == 0 || (line[0] == '#' && line[2] == '(')) continue;
     sents.resize(sents.size() + 1);
     auto& cur_sent = sents.back();
     if (is_training) {  // at training time, we load both "UNKified" versions of the data, and raw versions
@@ -129,7 +129,7 @@ void TopDownOracleGen::load_oracle(const string& file) {
     ++lc;
     //cerr << "line number = " << lc << endl;
     cur_acts.clear();
-    if (line.size() == 0 || (line[0] == '!' && line[1] == '#')) continue;
+    if (line.size() == 0 || (line[0] == '#' && line[2] == '(')) continue;
     sents.resize(sents.size() + 1);
     auto& cur_sent = sents.back();
     getline(in, line);

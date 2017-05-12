@@ -1165,7 +1165,7 @@ int main(int argc, char** argv) {
         double dwords = 0;
         auto t_start = chrono::high_resolution_clock::now();
 	const vector<int> actions;
-        for (unsigned sii = 0; sii < test_size; ++sii) {
+        /*for (unsigned sii = 0; sii < test_size; ++sii) {
            const auto& sentence=test_corpus.sents[sii];
            dwords += sentence.size();
            for (unsigned z = 0; z < N_SAMPLES; ++z) {
@@ -1193,9 +1193,9 @@ int main(int argc, char** argv) {
              }
              cout << endl;
            }
-       }
+       }*/
        ostringstream os;
-        os << "/tmp/parser_test_eval." << getpid() << ".txt";
+        os << "parser_test_eval." << getpid() << ".txt";
         const string pfx = os.str();
         ofstream out(pfx.c_str());
         t_start = chrono::high_resolution_clock::now();
@@ -1234,7 +1234,7 @@ int main(int argc, char** argv) {
         auto t_end = chrono::high_resolution_clock::now();
         out.close();
         double err = (trs - right) / trs;
-        cerr << "Test output in " << pfx << endl;
+        /*cerr << "Test output in " << pfx << endl;
         //parser::EvalBResults res = parser::Evaluate("foo", pfx);
         std::string command="python remove_dev_unk.py "+ corpus.devdata +" "+pfx+" > evaluable.txt";
         const char* cmd=command.c_str();
@@ -1262,6 +1262,6 @@ int main(int argc, char** argv) {
         }
 
        cerr<<"F1score: "<<newfmeasure<<"\n";
-    
+    	*/
   }
 }

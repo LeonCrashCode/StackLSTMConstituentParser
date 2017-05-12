@@ -1233,7 +1233,7 @@ int main(int argc, char** argv) {
         double dwords = 0;
         auto t_start = chrono::high_resolution_clock::now();
 	const vector<int> actions;
-        for (unsigned sii = 0; sii < test_size; ++sii) {
+        /*for (unsigned sii = 0; sii < test_size; ++sii) {
            const auto& sentence=test_corpus.sents[sii];
            dwords += sentence.size();
            for (unsigned z = 0; z < N_SAMPLES; ++z) {
@@ -1251,8 +1251,11 @@ int main(int argc, char** argv) {
 	     }
              cout << endl;
            }
-       }
-        ofstream out("test.act");
+       }*/
+	ostringstream os;
+        os << "parser_test_eval." << getpid() << ".txt";
+        const string pfx = os.str();
+        ofstream out(pfx.c_str());
         t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < test_size; ++sii) {
            const auto& sentence=test_corpus.sents[sii];
@@ -1277,7 +1280,7 @@ int main(int argc, char** argv) {
         out.close();
         double err = (trs - right) / trs;
 
-        std::string command_1="python mid2tree.py test.act " + conf["test_data"].as<string>() + " > test.eval" ;
+        /*std::string command_1="python mid2tree.py test.act " + conf["test_data"].as<string>() + " > test.eval" ;
         const char* cmd_1=command_1.c_str();
         cerr<<system(cmd_1)<<"\n";
 
@@ -1308,6 +1311,6 @@ int main(int argc, char** argv) {
         }
 
        cerr<<"F1score: "<<newfmeasure<<"\n";
-    
+    	*/
   }
 }

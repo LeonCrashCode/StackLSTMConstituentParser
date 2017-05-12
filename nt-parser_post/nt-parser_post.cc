@@ -966,7 +966,10 @@ int main(int argc, char** argv) {
              cout << endl;
            }
        }*/
-        ofstream out("test.act");
+	ostringstream os;
+        os << "parser_test_eval." << getpid() << ".txt";
+        const string pfx = os.str();
+        ofstream out(pfx.c_str());
         t_start = chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < test_size; ++sii) {
            const auto& sentence=test_corpus.sents[sii];
